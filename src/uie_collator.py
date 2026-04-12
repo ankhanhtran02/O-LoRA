@@ -90,7 +90,11 @@ class DataCollatorForUIE:
             instruction = self.get_instruction(instance)
 
             source = instruction
-            tokenized_source = self.tokenizer(source)["input_ids"]
+            tokenized_source = self.tokenizer(
+                source,
+                max_length=self.max_source_length,
+                truncation=True,
+            )["input_ids"]
             if len(tokenized_source) <= self.max_source_length:
                 sources.append(source)
             else:
@@ -149,8 +153,16 @@ class DataCollatorForUIE:
             task_input = self.tokenizer.bos_token + instruction
             label = label + self.tokenizer.eos_token
 
-            tokenized_input = self.tokenizer(task_input)["input_ids"]
-            tokenized_label = self.tokenizer(label)["input_ids"]
+            tokenized_input = self.tokenizer(
+                task_input,
+                max_length=limit_input_len,
+                truncation=True,
+            )["input_ids"]
+            tokenized_label = self.tokenizer(
+                label,
+                max_length=self.max_target_length,
+                truncation=True,
+            )["input_ids"]
 
             # (input) for inference, (input + label) for training
             if instance['subset'] in ['dev', 'test']:

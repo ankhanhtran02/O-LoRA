@@ -1,5 +1,8 @@
-transformers==4.28.0
+transformers==4.36.2
 datasets==1.17.0
+fsspec==2023.6.0
+pyarrow==14.0.2
+numpy==1.26.4
 deepspeed==0.10.0
 fairscale==0.4.5
 ipython==8.14.0
@@ -7,8 +10,13 @@ nltk==3.8.1
 tensorboard==2.13.0
 tqdm==4.65.0
 rouge_score==0.1.2
-wandb==0.12.10
-sentencepiece==0.1.96
+wandb==0.16.6
+sentencepiece==0.2.0
 protobuf==3.20.3
 ninja==1.11.1
-accelerate==0.20.3
+accelerate==0.27.2
+tree-sitter==0.24.0
+tree-sitter-c-sharp==0.23.1
+tree-sitter-embedded-template==0.25.0
+tree-sitter-language-pack==0.7.2
+tree-sitter-yaml==0.7.2

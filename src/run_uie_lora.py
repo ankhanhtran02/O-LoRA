@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import datasets
-import nltk  # Here to have a nice missing dependency error message early on
+# import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
 from datasets import load_dataset
 
@@ -52,6 +52,8 @@ from uie_dataset_lora import gen_cache_path
 from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions
 from compute_metrics import compute_metrics, compute_grouped_metrics
 from model.llama import LlamaForCausalLM_with_lossmask
+from t5_dataset import T5Dataset
+from task_info import DATA_SPLIT_SIZE_POLICY, MAX_INPUT_LENGTH, MAX_TARGET_LENGTH
 
 # off wandb
 os.environ['WANDB_DISABLED'] = "True"
@@ -59,15 +61,15 @@ os.environ['WANDB_DISABLED'] = "True"
 logger = logging.getLogger(__name__)
 CURRENT_DIR = os.path.dirname(__file__)
 
-try:
-    nltk.data.find("tokenizers/punkt")
-except (LookupError, OSError):
-    if is_offline_mode():
-        raise LookupError(
-            "Offline mode: run this script without TRANSFORMERS_OFFLINE first to download nltk data files"
-        )
-    with FileLock(".lock") as lock:
-        nltk.download("punkt", quiet=True)
+# try:
+#     nltk.data.find("tokenizers/punkt")
+# except (LookupError, OSError):
+#     if is_offline_mode():
+#         raise LookupError(
+#             "Offline mode: run this script without TRANSFORMERS_OFFLINE first to download nltk data files"
+#         )
+#     with FileLock(".lock") as lock:
+#         nltk.download("punkt", quiet=True)
 
 
 @dataclass
@@ -77,6 +79,7 @@ class ModelArguments:
     """
 
     model_name_or_path: str = field(
+        default='Salesforce/codet5-large',
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
     config_name: Optional[str] = field(
@@ -113,10 +116,28 @@ class ModelArguments:
     )
     # added for AutoCL
     lora_dim: Optional[int] = field(
-        default=8,
+        default=16,
         metadata={
             "help": "Intrinsic dimension of the latent space."
         },
+    )
+    lora_alpha: Optional[int] = field(
+        default=32,
+        metadata={
+            "help": "The alpha parameter for Lora scaling."
+        },
+    )
+    lora_dropout: Optional[float] = field(
+        default=0.1,
+        metadata={
+            "help": "The dropout probability for Lora layers."
+        },
+    )
+    target_modules: Optional[list[str]] = field(
+        default_factory=lambda: ["q", "v", "k", "wi", "wo", "o"],  # for llama, t5
+        metadata={
+            "help": "The list of modules to apply Lora scaling."
+        }
     )
 
 
@@ -125,6 +146,7 @@ class DataTrainingArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
+    task: str = field(default=None, metadata={"help": "The name of the task to train on (e.g., 'CodeTrans' 'CodeSearchNet', 'BFP', 'CONCODE', 'TheVault_Csharp', 'KodCode', 'RunBugRun', 'CoST')."})
     lang: str = field(default=None, metadata={"help": "Language id for multilingual model."})
     data_dir: str = field(
         default=None, metadata={"help": "The directory for saving the UIE train/dev/test splits."}
@@ -159,14 +181,26 @@ class DataTrainingArguments:
     )
     # for decoder model, it means max_new_tokens
     max_target_length: Optional[int] = field(
-        default=50,
+        default=256,
         metadata={
             "help": "The maximum total sequence length for target text after tokenization. Sequences longer "
                     "than this will be truncated, sequences shorter will be padded."
         },
     )
+    top_p: Optional[float] = field(
+        default=0.95,
+        metadata={
+            "help": "The cumulative probability for nucleus sampling in decode stage."
+        },
+    )
+    temperature: Optional[float] = field(
+        default=0.2,
+        metadata={
+            "help": "The temperature for sampling in decode stage."
+        },
+    )
     repetition_penalty: Optional[float] = field(
-        default=1.0,
+        default=1.2,
         metadata={
             "help": "Penalty for repeat tokens in decode stage."
         },
@@ -179,10 +213,10 @@ class DataTrainingArguments:
         },
     )
     max_num_instances_per_task: int = field(
-        default=10000, metadata={"help": "The maximum number of instances we will consider for each training task."}
+        default=100000, metadata={"help": "The maximum number of instances we will consider for each training task."}
     )
     max_num_instances_per_eval_task: int = field(
-        default=200,
+        default=2000,
         metadata={"help": "The maximum number of instances we will consider for each validation/test task."}
     )
     max_train_samples: Optional[int] = field(
@@ -254,6 +288,16 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Overwrite some arguments
+    data_args.max_source_length = MAX_INPUT_LENGTH[data_args.task]
+    data_args.max_target_length = MAX_TARGET_LENGTH[data_args.task]
+    if data_args.max_train_samples is None:
+        data_args.max_train_samples = DATA_SPLIT_SIZE_POLICY[data_args.task]['train']
+    if data_args.max_eval_samples is None:
+        data_args.max_eval_samples = DATA_SPLIT_SIZE_POLICY[data_args.task]['validation']
+    if data_args.max_predict_samples is None:
+        data_args.max_predict_samples = DATA_SPLIT_SIZE_POLICY[data_args.task]['test']
+
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -291,22 +335,26 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
-    data_cache_dir = gen_cache_path(training_args.output_dir, data_args)
+    # data_cache_dir = gen_cache_path(training_args.output_dir, data_args)
 
     # Get the UIE dataset
-    raw_datasets = load_dataset(
-        os.path.join(CURRENT_DIR, "uie_dataset_lora.py"),
-        data_dir=data_args.data_dir,
-        task_config_dir=data_args.task_config_dir,
-        instruction_file=data_args.instruction_file,
-        instruction_strategy=data_args.instruction_strategy,
-        cache_dir=data_cache_dir,  # for debug, change dataset size, otherwise open it
-        max_num_instances_per_task=data_args.max_num_instances_per_task,
-        max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
-        num_examples=data_args.num_examples
-    )
-    raw_datasets.cleanup_cache_files()
+    # raw_datasets = load_dataset(
+    #     os.path.join(CURRENT_DIR, "uie_dataset_lora.py"),
+    #     data_dir=data_args.data_dir,
+    #     task_config_dir=data_args.task_config_dir,
+    #     instruction_file=data_args.instruction_file,
+    #     instruction_strategy=data_args.instruction_strategy,
+    #     cache_dir=data_cache_dir,  # for debug, change dataset size, otherwise open it
+    #     max_num_instances_per_task=data_args.max_num_instances_per_task,
+    #     max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
+    #     num_examples=data_args.num_examples
+    # )
+    # raw_datasets.cleanup_cache_files()
 
+    raw_datasets = T5Dataset(None, data_args.task) \
+        .get_final_ds(
+            {'train': data_args.max_train_samples, 'validation': data_args.max_eval_samples, 'test': data_args.max_predict_samples},
+            seed=0)
     # Load pretrained model and tokenizer
     #
     # Distributed training:
@@ -378,7 +426,7 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None
         )
         peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32, lora_dropout=0.1
+            task_type=TaskType.CAUSAL_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=model_args.lora_alpha, lora_dropout=model_args.lora_dropout
         )
         model = get_peft_model(model, peft_config)
     else:
@@ -391,7 +439,7 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
         )
         peft_config = LoraConfig(
-            task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32, lora_dropout=0.1
+            task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=model_args.lora_alpha, lora_dropout=model_args.lora_dropout
         )
         model = get_peft_model(model, peft_config)
 
@@ -438,22 +486,22 @@ def main():
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = raw_datasets["train"]
-        if data_args.max_train_samples is not None:
-            train_dataset = train_dataset.select(range(data_args.max_train_samples))
+        # if data_args.max_train_samples is not None:
+        #     train_dataset = train_dataset.select(range(data_args.max_train_samples))
 
     if training_args.do_eval:
         if "validation" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = raw_datasets["validation"]
-        if data_args.max_eval_samples is not None:
-            eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
+        # if data_args.max_eval_samples is not None:
+        #     eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
 
     if training_args.do_predict:
         if "test" not in raw_datasets:
             raise ValueError("--do_predict requires a test dataset")
         predict_dataset = raw_datasets["test"]
-        if data_args.max_predict_samples is not None:
-            predict_dataset = predict_dataset.select(range(data_args.max_predict_samples))
+        # if data_args.max_predict_samples is not None:
+        #     predict_dataset = predict_dataset.select(range(data_args.max_predict_samples))
 
     # Data collator
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
@@ -478,10 +526,11 @@ def main():
     def compute_rouge_metrics(dataset, preds, save_prefix=None):
         decoded_preds = skip_instructions(model, preds, tokenizer)
         references = [e["Instance"]["label"] for e in dataset]
-        result = compute_metrics(predictions=decoded_preds, references=references)
-        result_per_task = compute_grouped_metrics(predictions=decoded_preds, references=references,
-                                                  groups=dataset["Task"])
-        result.update(result_per_task)
+        result = {}
+        # result = compute_metrics(predictions=decoded_preds, references=references)
+        # result_per_task = compute_grouped_metrics(predictions=decoded_preds, references=references,
+        #                                           groups=dataset["Task"])
+        # result.update(result_per_task)
         categories = dataset["Dataset"]
         result_per_category = compute_grouped_metrics(predictions=decoded_preds, references=references,
                                                       groups=categories)
@@ -553,6 +602,8 @@ def main():
 
     num_beams = data_args.num_beams if data_args.num_beams is not None else training_args.generation_num_beams
     repetition_penalty = data_args.repetition_penalty
+    top_p = data_args.top_p
+    temperature = data_args.temperature
 
     if training_args.do_predict:
         logger.info("*** Prediction ***")
@@ -567,7 +618,10 @@ def main():
             max_new_tokens=max_new_tokens,
             num_beams=num_beams,
             repetition_penalty=repetition_penalty,
-            pad_token_id=tokenizer.pad_token_id
+            pad_token_id=tokenizer.pad_token_id,
+            top_p=top_p,
+            temperature=temperature,
+            do_sample=not (num_beams > 1 or top_p < 1.0 or temperature != 1.0),
         )
         metrics = predict_results.metrics
         max_predict_samples = (

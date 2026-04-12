@@ -4,6 +4,15 @@ from transformers.trainer_seq2seq import Seq2SeqTrainer
 from transformers.trainer import *
 from transformers.trainer_callback import TrainerCallback
 
+try:
+    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+except Exception:
+    try:
+        from transformers.deepspeed import is_deepspeed_zero3_enabled
+    except Exception:
+        def is_deepspeed_zero3_enabled():
+            return False
+
 from uie_collator import SUPPORTED_DECODER_MODELS, check_model
 from uie_dataset_lora import ANSWER_PREFIX
 
@@ -109,9 +118,12 @@ class UIETrainer(Seq2SeqTrainer):
         loss = loss + orthogonal_loss * lamda_1 + l2_loss * lamda_2
         ######################################################################
 
-        if self.do_grad_scaling:
+        do_grad_scaling = getattr(self, "do_grad_scaling", False)
+        use_apex = getattr(self, "use_apex", False)
+
+        if do_grad_scaling:
             self.scaler.scale(loss).backward()
-        elif self.use_apex:
+        elif use_apex:
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         elif self.deepspeed:
@@ -191,6 +203,25 @@ class UIETrainer(Seq2SeqTrainer):
         all_labels = None
         # Will be useful when we have an iterable dataset so don't know its length.
 
+        pad_across_processes = getattr(self, "_pad_across_processes", None)
+        if pad_across_processes is None:
+            pad_across_processes = self.accelerator.pad_across_processes
+
+        nested_gather = getattr(self, "_nested_gather", None)
+        if nested_gather is None:
+            nested_gather = self.accelerator.gather_for_metrics
+
+        nested_truncate_fn = globals().get("nested_truncate", None)
+        if nested_truncate_fn is None:
+            def nested_truncate_fn(tensors, limit):
+                if isinstance(tensors, torch.Tensor):
+                    return tensors[:limit]
+                if isinstance(tensors, np.ndarray):
+                    return tensors[:limit]
+                if isinstance(tensors, (list, tuple)):
+                    return type(tensors)(nested_truncate_fn(t, limit) for t in tensors)
+                return tensors
+
         observed_num_examples = 0
         # Main evaluation loop
         for step, inputs in enumerate(dataloader):
@@ -207,15 +238,15 @@ class UIETrainer(Seq2SeqTrainer):
 
             # Update containers on host
             if loss is not None:
-                losses = self._nested_gather(loss.repeat(batch_size))
+                losses = nested_gather(loss.repeat(batch_size))
                 losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
             if labels is not None:
-                labels = self._pad_across_processes(labels)
-                labels = self._nested_gather(labels)
+                labels = pad_across_processes(labels)
+                labels = nested_gather(labels)
                 labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
             if logits is not None:
-                logits = self._pad_across_processes(logits)
-                logits = self._nested_gather(logits)
+                logits = pad_across_processes(logits)
+                logits = nested_gather(logits)
                 if self.preprocess_logits_for_metrics is not None:
                     logits = self.preprocess_logits_for_metrics(logits, labels)
                 preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
@@ -268,9 +299,9 @@ class UIETrainer(Seq2SeqTrainer):
         if all_losses is not None:
             all_losses = all_losses[:num_samples]
         if all_preds is not None:
-            all_preds = nested_truncate(all_preds, num_samples)
+            all_preds = nested_truncate_fn(all_preds, num_samples)
         if all_labels is not None:
-            all_labels = nested_truncate(all_labels, num_samples)
+            all_labels = nested_truncate_fn(all_labels, num_samples)
 
         # Metrics!
         if self.compute_metrics is not None and all_preds is not None and all_labels is not None:
@@ -330,9 +361,11 @@ class UIETrainer(Seq2SeqTrainer):
         has_labels = "labels" in inputs
         inputs = self._prepare_inputs(inputs)
 
-        # XXX: adapt synced_gpus for fairscale as well
-        gen_kwargs = self._gen_kwargs
-        gen_kwargs["synced_gpus"] = True if is_deepspeed_zero3_enabled() else False
+        # Keep GenerationConfig kwargs separate from generate()-only kwargs like synced_gpus.
+        gen_kwargs = dict(self._gen_kwargs)
+        generate_kwargs = {
+            "synced_gpus": True if is_deepspeed_zero3_enabled() else False
+        }
 
         if "attention_mask" in inputs:
             gen_kwargs["attention_mask"] = inputs.get("attention_mask", None)
@@ -349,15 +382,29 @@ class UIETrainer(Seq2SeqTrainer):
 
         generated_tokens = self.model.generate(
             input_ids=generation_inputs, 
-            generation_config=generation_config
+            generation_config=generation_config,
+            **generate_kwargs,
         )
 
         bs, source_len = inputs['input_ids'].shape
         # in case the batch is shorter than max length, the output should be padded
+        target_gen_len = gen_kwargs.get("max_new_tokens")
+        if target_gen_len is None:
+            if gen_kwargs.get("max_length") is not None:
+                if check_model(self.model.config._name_or_path, SUPPORTED_DECODER_MODELS):
+                    target_gen_len = max(0, gen_kwargs["max_length"] - source_len)
+                else:
+                    target_gen_len = gen_kwargs["max_length"]
+            else:
+                if check_model(self.model.config._name_or_path, SUPPORTED_DECODER_MODELS):
+                    target_gen_len = max(0, generated_tokens.shape[-1] - source_len)
+                else:
+                    target_gen_len = generated_tokens.shape[-1]
+
         if check_model(self.model.config._name_or_path, SUPPORTED_DECODER_MODELS):
-            max_length = source_len + gen_kwargs["max_new_tokens"]
+            max_length = source_len + target_gen_len
         else:
-            max_length = gen_kwargs["max_new_tokens"]
+            max_length = target_gen_len
 
         if generated_tokens.shape[-1] < max_length:
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, max_length)
@@ -378,8 +425,8 @@ class UIETrainer(Seq2SeqTrainer):
 
         if has_labels:
             labels = inputs["labels"]
-            if labels.shape[-1] < gen_kwargs["max_new_tokens"]:
-                labels = self._pad_tensors_to_max_len(labels, gen_kwargs["max_new_tokens"])
+            if labels.shape[-1] < target_gen_len:
+                labels = self._pad_tensors_to_max_len(labels, target_gen_len)
         else:
             labels = None
 

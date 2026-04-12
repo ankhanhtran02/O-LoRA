@@ -1,0 +1,6 @@
+.venv
+logs_and_outputs*
+CL_Benchmark*
+logs_and_outputs_llama*
+.codex
+**/__pycache__/
