@@ -184,7 +184,11 @@ class T5Dataset:
         splits = ['train', 'validation', 'test']
         datasets_dict = {}
         for split in splits:
-            ds = load_dataset("dongg18/CODETASK_with_instruction_pool", task, split=split)
+            ds = load_dataset(
+                "dongg18/CODETASK_with_instruction_pool",
+                data_files={split: f"{task}/{split}-*.parquet"},
+                split=split,
+            )
             datasets_dict[split] = ds
 
         for split, dataset in datasets_dict.items():
@@ -216,9 +220,9 @@ class T5Dataset:
 if __name__ == "__main__":
     tokenizer = None
     dataset = T5Dataset(tokenizer, 'CodeSearchNet')
-    data_size_dict = {'train': 2000, 'validation': 500, 'test': 500}
+    data_size_dict = {'train': -1, 'validation': -1, 'test': -1}
     final_ds = dataset.get_final_ds(data_size_dict)
     print(final_ds['train'])
     print(final_ds['validation'])
     print(final_ds['test'])
-    print(json.dumps(final_ds['train'][0], indent=2))
+    print(json.dumps(final_ds['validation'][0], indent=2))
